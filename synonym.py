@@ -302,27 +302,5 @@ def main():
         json.dump(vocab, f, ensure_ascii=False, indent=2)
     print("[OK] Saved vocab_kaggle.json (index -> word)")
 
-    # Simple local helper: top-k from embeddings (numpy)
-    weights = embeddings.cpu().numpy()
-    word2idx = {w: i for i, w in enumerate(vocab)}
-
-    def get_similar_from_weights(text, topn=10):
-        enc = tokenizer(text, return_tensors="pt")
-        enc = {k: v.to(DEVICE) for k, v in enc.items()}
-        with torch.no_grad():
-            out = fine_tuned(**enc).last_hidden_state[:,0]
-            vec = out.cpu().numpy()[0]
-        sims = weights @ vec
-        norms = np.linalg.norm(weights, axis=1) * np.linalg.norm(vec) + 1e-12
-        sims = sims / norms
-        idxs = np.argsort(sims)[::-1][:topn]
-        return [(vocab[i], float(sims[i])) for i in idxs]
-
-    # demo
-    demo_ctx = "I felt so happy after getting good news"
-    print("\nTop related words (demo):")
-    for w, s in get_similar_from_weights(demo_ctx, topn=10):
-        print(f"  {w:20s} {s:.3f}")
-
 if __name__ == "__main__":
     main()
