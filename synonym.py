@@ -1,306 +1,277 @@
 """
-bert_kaggle_syn_ant.py
-
-End-to-end: Kaggle synonyms/antonyms -> contrastive fine-tune BERT -> ONNX export
+Fast synonym/antonym fine-tuning (optimized for local/MPS)
+----------------------------------------------------------
+- Uses MiniLM sentence-transformer (small & fast)
+- Short context (max_length=32)
+- Sharded training for large datasets
+- Freezes lower encoder layers
+- MPS / CPU friendly (no AMP)
 """
 
-import os
-import json
-import random
-import math
-import argparse
+import json, random, torch, numpy as np
 from pathlib import Path
 from tqdm import tqdm
-import numpy as np
-import pandas as pd
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
-
-from transformers import AutoTokenizer, AutoModel, logging as hf_logging
-
-hf_logging.set_verbosity_error()  # quieter transformers output
+from transformers import AutoTokenizer, AutoModel
 
 # ---------------------------
-# CONFIGURABLE PARAMETERS
+# CONFIG
 # ---------------------------
-DATA_FILE = "kaggle_syn_ant.json"   # <-- set this to your Kaggle file path
-MODEL_NAME = "bert-base-uncased"
-ONNX_OUT = "bert_kaggle_syn_ant_context.onnx"
+DATA_FILE = "kaggle_syn_ant.json"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+ONNX_OUT = "synonym.onnx"
+BATCH_SIZE = 64
+EPOCHS = 1
+LR = 3e-5
+MARGIN = 0.3
+SYN_THR, ANT_THR = 0.5, -0.5
+SHARD_SIZE = 10_000
+MAX_LEN = 32
 
-# thresholds (tune these)
-SYN_SCORE_THRESHOLD = 0.5   # score >= this => treat as synonym
-ANT_SCORE_THRESHOLD = -0.5  # score <= this => treat as antonym
-
-# training params
-BATCH_SIZE = 16
-EPOCHS = 2
-LR = 2e-5
-MARGIN = 0.4
-
-# runtime device (MPS / CUDA / CPU)
-DEVICE = torch.device("mps" if torch.backends.mps.is_available()
-                      else ("cuda" if torch.cuda.is_available() else "cpu"))
+# ---------------------------
+# DEVICE
+# ---------------------------
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 print(f"[INFO] Using device: {DEVICE}")
 
+torch.set_num_threads(4)
+
 # ---------------------------
-# UTIL: load Kaggle dataset format (support JSON or JSONL)
+# Load Kaggle dataset
 # ---------------------------
-def load_kaggle_file(path):
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found. Put the Kaggle dataset JSON here or change DATA_FILE.")
-    # Try to determine file format: JSON (one dict) or JSONL (one JSON per line)
-    text = path.read_text(encoding="utf-8", errors="ignore").strip()
-    try:
-        data = json.loads(text)
-        # Expecting either dict: { "word": { related:score, ... }, ... }
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    # Otherwise try JSONL / line-delimited
-    data = {}
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                # if obj is dict with single top-level word
-                # merge into data
-                for k, v in obj.items():
-                    if isinstance(v, dict):
-                        data[k] = v
-                    else:
-                        data[k] = v
-            except Exception:
-                # fallback: treat line as "word <tab> json"
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    w, j = parts
-                    try:
-                        data[w] = json.loads(j)
-                    except Exception:
-                        pass
+def load_kaggle_json(path):
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    data = json.loads(text)
     return data
 
-# ---------------------------
-# Build synonym & antonym pairs from the Kaggle mapping
-# Format expected (example): { "gotten": { "net": 0.843886, "dress": 0.5, "gratify": -0.625, ...}, ... }
-# ---------------------------
-def build_pairs_from_kaggle(mapping, syn_thr=SYN_SCORE_THRESHOLD, ant_thr=ANT_SCORE_THRESHOLD, max_pairs=None):
-    synonym_pairs = []
-    antonym_pairs = []
-    vocab_set = set()
-    for head, related in mapping.items():
-        head = head.strip()
-        vocab_set.add(head)
-        if not isinstance(related, dict):
+def build_pairs(mapping):
+    syn, ant, vocab = [], [], set()
+    for w, rels in mapping.items():
+        if not isinstance(rels, dict):
             continue
-        for rword, score in related.items():
-            r = rword.strip()
-            vocab_set.add(r)
-            # convert score to float (robust)
+        for rw, s in rels.items():
             try:
-                s = float(score)
-            except Exception:
+                sc = float(s)
+            except:
                 continue
-            if s >= syn_thr:
-                synonym_pairs.append((head, r))
-            elif s <= ant_thr:
-                antonym_pairs.append((head, r))
-            # else ignore borderline
-    # Optionally cap pairs for performance
-    if max_pairs:
-        if len(synonym_pairs) > max_pairs:
-            synonym_pairs = random.sample(synonym_pairs, max_pairs)
-        if len(antonym_pairs) > max_pairs:
-            antonym_pairs = random.sample(antonym_pairs, max_pairs)
-    return synonym_pairs, antonym_pairs, sorted(vocab_set)
+            vocab.update([w.strip(), rw.strip()])
+            if sc >= SYN_THR:
+                syn.append((w, rw))
+            elif sc <= ANT_THR:
+                ant.append((w, rw))
+    random.shuffle(syn); random.shuffle(ant)
+    return syn, ant, sorted(vocab)
 
 # ---------------------------
-# Dataset for pairs (we provide each side as a short "context" sentence)
-# We'll create small contexts like "the word: <word>" so BERT has tokens and some context.
+# Dataset + collate
 # ---------------------------
 class WordPairDataset(Dataset):
-    def __init__(self, pairs, labels, tokenizer, template="the word: {}"):
-        self.pairs = pairs
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.template = template
-    def __len__(self):
-        return len(self.pairs)
-    def __getitem__(self, idx):
-        a, b = self.pairs[idx]
-        la = self.labels[idx]
-        ta = self.template.format(a)
-        tb = self.template.format(b)
-        return ta, tb, la
-    @staticmethod
-    def collate(batch, tokenizer):
-        a_texts, b_texts, labels = zip(*batch)
-        enc_a = tokenizer(list(a_texts), padding=True, truncation=True, return_tensors="pt")
-        enc_b = tokenizer(list(b_texts), padding=True, truncation=True, return_tensors="pt")
-        labels = torch.tensor(labels, dtype=torch.float)
-        return enc_a, enc_b, labels
+    def __init__(self, pairs, labels, tokenizer):
+        self.pairs, self.labels, self.tok = pairs, labels, tokenizer
+    def __len__(self): return len(self.pairs)
+    def __getitem__(self, i):
+        a, b = self.pairs[i]
+        label = self.labels[i]
+        ctx_a = f"Context: ... {a} ..."
+        ctx_b = f"Context: ... {b} ..."
+        return ctx_a, a, ctx_b, b, label
+
+def wordpair_collate(batch, tok):
+    ctx_a, targ_a, ctx_b, targ_b, labels = zip(*batch)
+
+    enc_a = tok(list(ctx_a), return_tensors="pt", padding="max_length",
+                truncation=True, max_length=MAX_LEN, return_offsets_mapping=True)
+    enc_b = tok(list(ctx_b), return_tensors="pt", padding="max_length",
+                truncation=True, max_length=MAX_LEN, return_offsets_mapping=True)
+
+    def find_positions(enc, ctxs, targets):
+        offmaps = enc.pop("offset_mapping")
+        pos_list = []
+        for i, (ctx, tgt) in enumerate(zip(ctxs, targets)):
+            start_char = ctx.find(tgt)
+            pos = 0
+            if start_char != -1:
+                for tok_idx, (s, e) in enumerate(offmaps[i].tolist()):
+                    if s <= start_char < e:
+                        pos = tok_idx
+                        break
+            pos_list.append(pos)
+        return torch.tensor(pos_list, dtype=torch.long)
+
+    pos_a = find_positions(enc_a, ctx_a, targ_a)
+    pos_b = find_positions(enc_b, ctx_b, targ_b)
+    return enc_a, pos_a, enc_b, pos_b, torch.tensor(labels, dtype=torch.float)
+
+def shard_pairs(pairs, labels, shard_size=SHARD_SIZE):
+    for i in range(0, len(pairs), shard_size):
+        yield pairs[i:i+shard_size], labels[i:i+shard_size]
 
 # ---------------------------
-# Training function (contrastive with MarginRankingLoss)
+# Training
 # ---------------------------
-def train_contrastive(bert, tokenizer, synonym_pairs, antonym_pairs,
-                      device=DEVICE, batch_size=BATCH_SIZE, epochs=EPOCHS, lr=LR, margin=MARGIN):
-    # Combine and label: synonyms -> +1, antonyms -> -1
-    pairs = synonym_pairs + antonym_pairs
-    labels = [1]*len(synonym_pairs) + [-1]*len(antonym_pairs)
-    # shuffle
-    idxs = list(range(len(pairs)))
-    random.shuffle(idxs)
-    pairs = [pairs[i] for i in idxs]
-    labels = [labels[i] for i in idxs]
-    ds = WordPairDataset(pairs, labels, tokenizer)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: WordPairDataset.collate(b, tokenizer))
-    opt = torch.optim.AdamW(bert.parameters(), lr=lr)
-    criterion = nn.MarginRankingLoss(margin=margin)
-    bert = bert.to(device)
-    bert.train()
-    for epoch in range(epochs):
-        running_loss = 0.0
-        n_batches = 0
-        for enc_a, enc_b, labs in tqdm(loader, desc=f"Train epoch {epoch+1}/{epochs}"):
-            # move to device
-            enc_a = {k:v.to(device) for k,v in enc_a.items()}
-            enc_b = {k:v.to(device) for k,v in enc_b.items()}
-            labs = labs.to(device)
-            opt.zero_grad()
-            out_a = bert(**enc_a).last_hidden_state[:,0]  # [B, D]
-            out_b = bert(**enc_b).last_hidden_state[:,0]  # [B, D]
-            sim = F.cosine_similarity(out_a, out_b)       # [B]
-            # We want sim(a,b) > sim_threshold for synonyms and sim(a,b) < -something for antonyms.
-            # MarginRankingLoss expects inputs x1,x2 and target y in {-1,1} and computes:
-            # loss = max(0, -y * (x1 - x2) + margin)
-            # We'll set x1 = sim, x2 = zeros, so for y=1 (synonym) we want sim > 0 by margin
-            zeros = torch.zeros_like(sim).to(device)
-            loss = criterion(sim, zeros, labs)
-            loss.backward()
-            opt.step()
-            running_loss += loss.item()
-            n_batches += 1
-        avg = running_loss / max(1, n_batches)
-        print(f"Epoch {epoch+1} avg loss: {avg:.6f}")
-    return bert
+def train_fast(model, tokenizer, syn, ant):
+    pairs = syn + ant
+    labels = [1]*len(syn) + [-1]*len(ant)
+    mix = list(zip(pairs, labels))
+    random.shuffle(mix)
+    pairs, labels = zip(*mix)
+
+    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    loss_fn = nn.MarginRankingLoss(margin=MARGIN)
+    model.train()
+
+    for epoch in range(EPOCHS):
+        shard_losses = []
+        for shard_idx, (p_shard, l_shard) in enumerate(shard_pairs(pairs, labels)):
+            ds = WordPairDataset(p_shard, l_shard, tokenizer)
+            dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
+                            collate_fn=lambda b: wordpair_collate(b, tokenizer),
+                            num_workers=0)
+
+            tot = 0.0
+            for enc_a, pos_a, enc_b, pos_b, labs in tqdm(
+                dl, desc=f"Epoch {epoch+1}/{EPOCHS} – shard {shard_idx+1}"
+            ):
+                enc_a = {k: v.to(DEVICE) for k, v in enc_a.items()}
+                enc_b = {k: v.to(DEVICE) for k, v in enc_b.items()}
+                pos_a, pos_b, labs = pos_a.to(DEVICE), pos_b.to(DEVICE), labs.to(DEVICE)
+
+                opt.zero_grad()
+                # merge both
+                input_ids = torch.cat([enc_a["input_ids"], enc_b["input_ids"]], dim=0)
+                attention_mask = torch.cat(
+                    [enc_a["attention_mask"], enc_b["attention_mask"]], dim=0
+                )
+
+                out = model(input_ids=input_ids, attention_mask=attention_mask)
+                hidden = out.last_hidden_state
+                B = enc_a["input_ids"].size(0)
+                hidden_a, hidden_b = hidden[:B], hidden[B:]
+                idx = torch.arange(B, device=hidden.device)
+                vec_a = hidden_a[idx, pos_a]
+                vec_b = hidden_b[idx, pos_b]
+                sim = F.cosine_similarity(vec_a, vec_b)
+                loss = loss_fn(sim, torch.zeros_like(sim), labs)
+
+                loss.backward()
+                opt.step()
+                tot += loss.item()
+
+            avg_loss = tot / len(dl)
+            shard_losses.append(avg_loss)
+            print(f"[INFO] Finished shard {shard_idx+1}, avg loss {avg_loss:.4f}")
+            torch.save(model.state_dict(), f"checkpoint_shard{shard_idx+1}.pt")
+
+        print(f"Epoch {epoch+1} mean loss: {np.mean(shard_losses):.4f}")
+    return model
 
 # ---------------------------
-# Build vocab embeddings (encode each vocab word via BERT)
+# Build vocab embeddings
 # ---------------------------
-def build_vocab_embeddings(bert, tokenizer, vocab, device=DEVICE, batch=64):
-    bert.eval()
-    embs = []
-    for i in tqdm(range(0, len(vocab), batch), desc="Encoding vocab"):
-        batch_words = vocab[i:i+batch]
-        # create short context to help BERT (the same template used during training)
-        texts = [f"the word: {w}" for w in batch_words]
-        enc = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
+def build_vocab_emb(model, tokenizer, vocab):
+    model.eval()
+    allv = []
+    for i in tqdm(range(0, len(vocab), 128), desc="Encoding vocab"):
+        words = vocab[i:i+128]
+        ctxs = [f"Context: ... {w} ..." for w in words]
+        enc = tokenizer(ctxs, return_tensors="pt", padding="max_length",
+                        truncation=True, max_length=MAX_LEN,
+                        return_offsets_mapping=True).to(DEVICE)
+        offmaps = enc.pop("offset_mapping")
+        pos_list = []
+        for j, (ctx, w) in enumerate(zip(ctxs, words)):
+            start = ctx.find(w)
+            pos = 0
+            if start != -1:
+                for tok_idx, (s, e) in enumerate(offmaps[j].tolist()):
+                    if s <= start < e:
+                        pos = tok_idx
+                        break
+            pos_list.append(pos)
+        pos = torch.tensor(pos_list, dtype=torch.long, device=DEVICE)
         with torch.no_grad():
-            out = bert(**enc).last_hidden_state[:,0]  # [B, D]
-        embs.append(out.cpu())
-    embs = torch.cat(embs, dim=0)  # [V, D]
-    return embs
+            out = model(**enc)
+            hidden = out.last_hidden_state
+            idx = torch.arange(hidden.size(0), device=hidden.device)
+            vecs = hidden[idx, pos]
+        allv.append(vecs.cpu())
+    return torch.cat(allv, dim=0)
 
 # ---------------------------
-# ONNX wrapper: takes (input_ids, attention_mask) and outputs [B, V] cosine similarities
-# The embedding matrix is frozen (from fine-tuned BERT) for fast similarity compute
+# Target-aware ONNX wrapper
 # ---------------------------
-class BertContextCosine(nn.Module):
-    def __init__(self, base_bert, fixed_embeddings: torch.Tensor):
+class BertTargetCosine(nn.Module):
+    def __init__(self, bert, emb, tokenizer):
         super().__init__()
-        self.bert = base_bert
-        # fixed_embeddings: [V, D] (torch.FloatTensor)
-        self.emb = nn.Embedding.from_pretrained(fixed_embeddings, freeze=True)
-    def forward(self, input_ids, attention_mask):
-        # input_ids, attention_mask are tensors (B, seq_len)
+        self.bert = bert
+        self.emb = nn.Embedding.from_pretrained(emb, freeze=True)
+        self.tokenizer = tokenizer
+    def forward(self, input_ids, attention_mask, target_pos):
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        vec = out.last_hidden_state[:,0]            # [B, D]
-        vec_n = F.normalize(vec, p=2, dim=1)       # [B, D]
-        emb_n = F.normalize(self.emb.weight, p=2, dim=1)  # [V, D]
-        sims = torch.matmul(vec_n, emb_n.T)        # [B, V]
+        hidden = out.last_hidden_state
+        idx = torch.arange(hidden.size(0), device=hidden.device)
+        vec = hidden[idx, target_pos]
+        vec_n = F.normalize(vec, p=2, dim=1)
+        emb_n = F.normalize(self.emb.weight, p=2, dim=1)
+        sims = torch.matmul(vec_n, emb_n.T)
         return sims
 
 # ---------------------------
-# Main pipeline
+# MAIN
 # ---------------------------
 def main():
-    # load Kaggle data
-    mapping = load_kaggle_file(DATA_FILE)
-    print(f"[INFO] Loaded {len(mapping)} top-level entries from Kaggle file")
+    data = load_kaggle_json(DATA_FILE)
+    syn, ant, vocab = build_pairs(data)
+    print(f"[INFO] {len(syn)} syn, {len(ant)} ant, vocab={len(vocab)}")
 
-    # build pairs
-    synonyms, antonyms, vocab = build_pairs_from_kaggle(mapping,
-                                                       syn_thr=SYN_SCORE_THRESHOLD,
-                                                       ant_thr=ANT_SCORE_THRESHOLD,
-                                                       max_pairs=None)
-    print(f"[INFO] Built {len(synonyms)} synonym pairs and {len(antonyms)} antonym pairs")
-    print(f"[INFO] Vocab size from dataset: {len(vocab)}")
-
-    # trim or sample pairs if dataset huge (optional)
-    MAX_PAIRS_PER_TYPE = 50000
-    if len(synonyms) > MAX_PAIRS_PER_TYPE:
-        synonyms = random.sample(synonyms, MAX_PAIRS_PER_TYPE)
-    if len(antonyms) > MAX_PAIRS_PER_TYPE:
-        antonyms = random.sample(antonyms, MAX_PAIRS_PER_TYPE)
-
-    # load tokenizer + model
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     bert = AutoModel.from_pretrained(MODEL_NAME)
+
+    # Freeze all but top 2 encoder layers
+    for name, param in bert.named_parameters():
+        if not any(x in name for x in ["layer.5", "layer.4", "pooler", "classifier"]):
+            param.requires_grad = False
+
     bert.to(DEVICE)
+    ckpt_path = "checkpoint_shard424.pt"
+    if Path(ckpt_path).exists():
+        print(f"[INFO] Loading checkpoint {ckpt_path}")
+        bert.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+        fine = bert
+    else:
+        fine = train_fast(bert, tok, syn, ant)
 
-    # fine-tune contrastively
-    fine_tuned = train_contrastive(bert, tokenizer, synonyms, antonyms,
-                                   device=DEVICE, batch_size=BATCH_SIZE, epochs=EPOCHS, lr=LR, margin=MARGIN)
+    emb = build_vocab_emb(fine, tok, vocab)
+    print(f"[INFO] Embeddings: {emb.shape}")
 
-    # build vocab embeddings (from fine-tuned BERT)
-    embeddings = build_vocab_embeddings(fine_tuned, tokenizer, vocab, device=DEVICE, batch=64)
-    print(f"[INFO] Built embeddings shape: {embeddings.shape}")
-
-    # export ONNX
-    wrapper = BertContextCosine(fine_tuned, embeddings)
+    wrapper = BertTargetCosine(fine, emb, tok)
     wrapper.eval()
 
-    # example input to trace
-    example_text = "I felt very happy when the news came"
-    enc = tokenizer(example_text, return_tensors="pt")
-    input_ids = enc["input_ids"]
-    attention_mask = enc["attention_mask"]
+    text = "She felt happy after good news"
+    enc = tok(text, return_tensors="pt", truncation=True, max_length=MAX_LEN)
+    target_pos = torch.tensor([4], dtype=torch.long)
+    wrapper.to("cpu")
+    print("[INFO] Exporting ONNX...")
+    torch.onnx.export(wrapper, (enc["input_ids"], enc["attention_mask"], target_pos),
+                      ONNX_OUT,
+                      input_names=["input_ids","attention_mask","target_pos"],
+                      output_names=["cosine_similarity"],
+                      dynamic_axes={"input_ids":{0:"batch",1:"seq"},
+                                    "attention_mask":{0:"batch",1:"seq"},
+                                    "cosine_similarity":{0:"batch"}},
+                      opset_version=18)
+    print(f"[OK] Exported {ONNX_OUT}")
 
-    # Move example inputs to CPU for export (ONNX export uses CPU tensors)
-    # (transformers models are Torch modules; if bert is on GPU, we can temporarily move it to cpu for export)
-    wrapper_cpu = wrapper.to("cpu")
-    input_ids_cpu = input_ids
-    attention_mask_cpu = attention_mask
-
-    print("[INFO] Exporting ONNX model (this may take a minute)...")
-    torch.onnx.export(
-        wrapper_cpu,
-        (input_ids_cpu, attention_mask_cpu),
-        ONNX_OUT,
-        input_names=["input_ids", "attention_mask"],
-        output_names=["cosine_similarity"],
-        dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
-                      "attention_mask": {0: "batch", 1: "seq"},
-                      "cosine_similarity": {0: "batch"}},
-        opset_version=17,
-        do_constant_folding=True
-    )
-    print(f"[OK] ONNX exported to {ONNX_OUT}")
-
-    # Save vocabulary mapping to disk for inference usage
-    import json
-    with open("vocab_kaggle.json", "w", encoding="utf-8") as f:
-        json.dump(vocab, f, ensure_ascii=False, indent=2)
-    print("[OK] Saved vocab_kaggle.json (index -> word)")
+    with open("vocab_kaggle.json","w") as f:
+        json.dump(vocab,f,indent=2)
+    print("[OK] Saved vocab_kaggle.json")
 
 if __name__ == "__main__":
     main()
