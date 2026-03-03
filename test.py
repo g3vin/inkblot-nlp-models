@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 # -----------------------
 # CONFIG
 # -----------------------
-MODEL_PATH = "bert_kaggle_target_fast.onnx"
+MODEL_PATH = "synonym.onnx"
 VOCAB_PATH = "vocab_kaggle.json"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_LEN = 32
